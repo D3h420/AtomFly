@@ -1,43 +1,20 @@
-# AtomFly Web Test (minimal)
+# AtomFly Web Test (v0.1)
 
-Minimalny, testowy projekt do sterowania M5Stack Atom Fly z przeglądarki przez Wi‑Fi AP.
+Very early prototype (v0.1), under continuous construction.
 
-## Zawartość
-- `AtomFlyWebTest/AtomFlyWebTest.ino`
-- `AtomFlyWebTest/AtomFly.h`
-- `AtomFlyWebTest/AtomFly.cpp`
-
-Pliki `AtomFly.h/.cpp` pochodzą z oficjalnych przykładów M5Stack i są wymagane do użycia oficjalnych API Atom Fly.
-
-## Wymagane biblioteki Arduino
+## Arduino IDE — Required Libraries
 - `M5Atom`
 - `Adafruit BMP280`
 
-## Flashowanie
-1. Otwórz `AtomFlyWebTest/AtomFlyWebTest.ino` w Arduino IDE.
-2. Zainstaluj biblioteki: `M5Atom` i `Adafruit BMP280`.
-3. Wybierz odpowiednią płytkę (M5Stack Atom / ESP32) i port.
-4. Wgraj firmware.
+## Flashing
+1. Open `AtomFlyWebTest/AtomFlyWebTest.ino` in Arduino IDE.
+2. Install the libraries above.
+3. Upload to M5Stack Atom (ESP32).
 
-## Połączenie
+## Connection
 - SSID: `AtomFly-Test`
-- Hasło: `atomfly123`
-- Strona: `http://192.168.4.1`
+- Password: `atomfly123`
+- URL: `http://192.168.4.1`
 
-## Komendy (UI)
-- `START` — uruchamia silniki (ustawia bazowe PWM).
-- `UP` — zwiększa ciąg (podnosi drona).
-- `DOWN` — zmniejsza ciąg (opuszcza drona); gdy PWM spadnie do 0, dron się rozbraja.
-- `PRZÓD` — krótki „popych” do przodu (czasowo zmienia balans).
-- `OBRÓT 90° W LEWO` — czasowy obrót w lewo.
-- `OBRÓT 90° W PRAWO` — czasowy obrót w prawo.
-- `🚨 EMERGENCY STOP 🚨` — natychmiast odcina silniki i rozbraja (działa też na przycisku urządzenia).
-
-## Bezpieczeństwo (ważne)
-- Sterowanie po Wi‑Fi nie daje 100% gwarancji (zakłócenia RF, opóźnienia, zawieszenie).  
-  Zawsze miej fizyczne odcięcie zasilania w zasięgu ręki.
-- `EMERGENCY STOP` natychmiast odcina silniki i rozbraja, ale sieć może zawieść.
-- Parametry w kodzie są celowo konserwatywne. Zwiększaj je stopniowo.
-
-## Uwaga
-To jest prototyp testowy. Nie ma stabilizacji PID ani zaawansowanej kontroli lotu.
+## Note
+Test-only project, no PID or stabilization. Safety first.
