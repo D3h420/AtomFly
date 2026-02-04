@@ -18,9 +18,11 @@ const char* kApPass = "atomfly123"; // 8+ chars for WPA2
 const IPAddress kApIP(192, 168, 4, 1);
 const IPAddress kApNetmask(255, 255, 255, 0);
 
-const uint8_t  kStartPwm     = 95;   // Minimal spin-up PWM after START
+const uint8_t  kIdlePwm      = 55;   // Idle PWM after START (should NOT lift)
 const uint8_t  kPwmStep      = 10;   // UP/DOWN step size
 const uint8_t  kMaxPwm       = 180;  // Safety cap (tune carefully)
+const uint8_t  kPwmSlewStep  = 2;    // PWM change per slew step
+const uint16_t kPwmSlewMs    = 20;   // Slew interval in ms
 const uint8_t  kYawDelta     = 18;   // Yaw bias added/subtracted during rotate
 const uint8_t  kPitchDelta   = 18;   // Pitch bias for forward movement
 const uint32_t kRotateMs     = 700;  // Time-based 90-deg test (tune per frame)
@@ -28,6 +30,10 @@ const uint32_t kForwardMs    = 450;  // Short forward "nudge" (tune per frame)
 
 // Flip if left/right rotate direction is reversed
 const int8_t kYawDirection = 1;
+
+// Motor trim offsets to counter small imbalances (FL, FR, RR, RL).
+// Use small values like -3..+3. Defaults to 0.
+const int8_t kMotorTrim[4] = { 0, 0, 0, 0 };
 
 // =======================
 // Embedded Web UI
@@ -67,7 +73,7 @@ button:active { transform:scale(0.98); }
 <div class="grid">
   <button class="start" onclick="sendCmd('start')">
     <span class="label">START</span>
-    <span class="desc">uruchamia silniki</span>
+    <span class="desc">uruchamia silniki (niski ciąg)</span>
   </button>
   <button onclick="sendCmd('up')">
     <span class="label">UP</span>
@@ -129,7 +135,9 @@ enum Action { ACTION_NONE, ACTION_ROTATE_LEFT, ACTION_ROTATE_RIGHT, ACTION_FORWA
 
 bool armed = false;
 bool estop_latched = false;
-uint8_t base_pwm = 0;
+uint8_t base_pwm = 0;   // current PWM actually applied
+uint8_t target_pwm = 0; // requested PWM (ramps to this)
+uint32_t last_slew_ms = 0;
 
 Action action = ACTION_NONE;
 uint32_t action_start_ms = 0;
@@ -168,6 +176,12 @@ void applyMotors(uint8_t base, int16_t yaw_delta, int16_t pitch_delta) {
   pwm_rr += pitch_delta;
   pwm_rl += pitch_delta;
 
+  // Per-motor trim (small corrections only)
+  pwm_fl += kMotorTrim[0];
+  pwm_fr += kMotorTrim[1];
+  pwm_rr += kMotorTrim[2];
+  pwm_rl += kMotorTrim[3];
+
   pwm_fl = constrain(pwm_fl, 0, 255);
   pwm_fr = constrain(pwm_fr, 0, 255);
   pwm_rr = constrain(pwm_rr, 0, 255);
@@ -182,6 +196,7 @@ void applyMotors(uint8_t base, int16_t yaw_delta, int16_t pitch_delta) {
 void emergencyStop() {
   action = ACTION_NONE;
   base_pwm = 0;
+  target_pwm = 0;
   armed = false;
   estop_latched = true;
   fly.WriteAllPWM(0);
@@ -205,7 +220,7 @@ void handleStart() {
   estop_latched = false; // explicit re-arm
   armed = true;
   action = ACTION_NONE;
-  base_pwm = kStartPwm;
+  target_pwm = kIdlePwm;
   server.send(200, "text/plain", "STARTED");
 }
 
@@ -237,8 +252,8 @@ void handleUp() {
     return;
   }
   action = ACTION_NONE;
-  uint16_t next_pwm = base_pwm + kPwmStep;
-  base_pwm = (next_pwm > kMaxPwm) ? kMaxPwm : (uint8_t)next_pwm;
+  uint16_t next_pwm = target_pwm + kPwmStep;
+  target_pwm = (next_pwm > kMaxPwm) ? kMaxPwm : (uint8_t)next_pwm;
   server.send(200, "text/plain", "UP");
 }
 
@@ -248,12 +263,12 @@ void handleDown() {
     return;
   }
   action = ACTION_NONE;
-  int16_t next_pwm = (int16_t)base_pwm - (int16_t)kPwmStep;
+  int16_t next_pwm = (int16_t)target_pwm - (int16_t)kPwmStep;
   if (next_pwm <= 0) {
-    base_pwm = 0;
+    target_pwm = 0;
     armed = false; // stop motors when fully down
   } else {
-    base_pwm = (uint8_t)next_pwm;
+    target_pwm = (uint8_t)next_pwm;
   }
   server.send(200, "text/plain", "DOWN");
 }
@@ -279,7 +294,8 @@ void handleStatus() {
   json += "\"armed\":"; json += (armed ? "true" : "false"); json += ",";
   json += "\"estop\":"; json += (estop_latched ? "true" : "false"); json += ",";
   json += "\"action\":\""; json += actionName(); json += "\",";
-  json += "\"pwm\":"; json += String(base_pwm);
+  json += "\"pwm\":"; json += String(base_pwm); json += ",";
+  json += "\"target_pwm\":"; json += String(target_pwm);
   json += "}";
   server.send(200, "application/json", json);
 }
@@ -329,11 +345,13 @@ void loop() {
 
   if (estop_latched) {
     fly.WriteAllPWM(0);
+    base_pwm = 0;
     return;
   }
 
   if (!armed) {
     fly.WriteAllPWM(0);
+    base_pwm = 0;
     return;
   }
 
@@ -353,6 +371,17 @@ void loop() {
     } else {
       pitch_delta = kPitchDelta;
     }
+  }
+
+  if (timePassed(now, last_slew_ms + kPwmSlewMs)) {
+    if (base_pwm < target_pwm) {
+      uint16_t next_pwm = base_pwm + kPwmSlewStep;
+      base_pwm = (next_pwm > target_pwm) ? target_pwm : (uint8_t)next_pwm;
+    } else if (base_pwm > target_pwm) {
+      int16_t next_pwm = (int16_t)base_pwm - (int16_t)kPwmSlewStep;
+      base_pwm = (next_pwm < (int16_t)target_pwm) ? target_pwm : (uint8_t)next_pwm;
+    }
+    last_slew_ms = now;
   }
 
   applyMotors(base_pwm, yaw_delta, pitch_delta);
