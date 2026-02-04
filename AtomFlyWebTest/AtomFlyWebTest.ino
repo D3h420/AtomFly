@@ -23,7 +23,7 @@ const uint8_t  kPwmStep      = 10;   // UP/DOWN step size
 const uint8_t  kMaxPwm       = 180;  // Safety cap (tune carefully)
 const uint8_t  kPwmSlewStep  = 2;    // PWM change per slew step
 const uint16_t kPwmSlewMs    = 20;   // Slew interval in ms
-const float    kYawHoldKp    = 0.9f; // PWM per deg/s (gyro Z). Tune to stop spin.
+const float    kYawHoldKp    = 1.1f; // PWM per deg/s (gyro Z). Tune to stop spin.
 const int16_t  kYawHoldMax   = 22;   // Max yaw correction
 const float    kYawHoldDeadband = 1.5f; // deg/s deadband to avoid small bias
 const uint8_t  kYawHoldMinPwm = 35;  // Only apply yaw-hold above this PWM
@@ -36,11 +36,11 @@ const uint32_t kForwardMs    = 450;  // Short forward "nudge" (tune per frame)
 
 // Flip if left/right rotate direction is reversed
 const int8_t kYawDirection = 1;
-const int8_t kYawHoldDirection = 1; // Flip if yaw-hold makes spin worse
+const int8_t kYawHoldDirection = -1; // Flip if yaw-hold makes spin worse
 
 // Motor trim offsets to counter small imbalances (FL, FR, RR, RL).
 // Use small values like -3..+3. Defaults to 0.
-const int8_t kMotorTrim[4] = { 0, 0, 0, 0 };
+const int8_t kMotorTrim[4] = { -1, 0, 0, -1 };
 
 // =======================
 // Embedded Web UI
