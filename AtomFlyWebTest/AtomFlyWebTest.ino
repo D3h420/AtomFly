@@ -7,6 +7,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <M5Atom.h>
+#include <math.h>
 #include "AtomFly.h"
 
 // =======================
@@ -29,6 +30,10 @@ const float    kYawHoldDeadband = 1.5f; // deg/s deadband to avoid small bias
 const uint8_t  kYawHoldMinPwm = 35;  // Only apply yaw-hold above this PWM
 const uint16_t kGyroCalibMs   = 600; // Gyro Z bias calibration time
 const uint16_t kGyroSampleMs  = 5;   // Gyro sample interval during calibration
+const float    kLevelKp       = 1.2f; // PWM per deg (roll/pitch)
+const int16_t  kLevelMax      = 18;   // Max roll/pitch correction
+const float    kLevelDeadband = 1.0f; // deg deadband
+const uint8_t  kLevelMinPwm   = 40;   // Only apply leveling above this PWM
 const uint8_t  kYawDelta     = 18;   // Yaw bias added/subtracted during rotate
 const uint8_t  kPitchDelta   = 18;   // Pitch bias for forward movement
 const uint32_t kRotateMs     = 700;  // Time-based 90-deg test (tune per frame)
@@ -37,6 +42,8 @@ const uint32_t kForwardMs    = 450;  // Short forward "nudge" (tune per frame)
 // Flip if left/right rotate direction is reversed
 const int8_t kYawDirection = 1;
 const int8_t kYawHoldDirection = -1; // Flip if yaw-hold makes spin worse
+const int8_t kRollDirection = 1;    // Flip if roll leveling makes it worse
+const int8_t kPitchDirection = 1;   // Flip if pitch leveling makes it worse
 
 // Motor trim offsets to counter small imbalances (FL, FR, RR, RL).
 // Use small values like -3..+3. Defaults to 0.
@@ -152,6 +159,11 @@ uint32_t gyro_calib_last_ms = 0;
 float gyro_z_bias = 0.0f;
 float gyro_z_acc = 0.0f;
 uint16_t gyro_z_samples = 0;
+float level_roll_bias = 0.0f;
+float level_pitch_bias = 0.0f;
+float level_roll_acc = 0.0f;
+float level_pitch_acc = 0.0f;
+uint16_t level_samples = 0;
 
 Action action = ACTION_NONE;
 uint32_t action_start_ms = 0;
@@ -164,7 +176,7 @@ bool timePassed(uint32_t now, uint32_t end_ms) {
   return (int32_t)(now - end_ms) >= 0;
 }
 
-void applyMotors(uint8_t base, int16_t yaw_delta, int16_t pitch_delta) {
+void applyMotors(uint8_t base, int16_t yaw_delta, int16_t pitch_delta, int16_t roll_delta) {
   // Yaw: A/C vs B/D. Pitch: front vs rear.
   // If forward/back is reversed, swap front/rear motors below.
   const uint8_t motor_front_left  = AtomFly::kMotor_A;
@@ -189,6 +201,12 @@ void applyMotors(uint8_t base, int16_t yaw_delta, int16_t pitch_delta) {
   pwm_fr -= pitch_delta;
   pwm_rr += pitch_delta;
   pwm_rl += pitch_delta;
+
+  // Roll influence (positive roll_delta lifts right, lowers left)
+  pwm_fl -= roll_delta;
+  pwm_rl -= roll_delta;
+  pwm_fr += roll_delta;
+  pwm_rr += roll_delta;
 
   // Per-motor trim (small corrections only)
   pwm_fl += kMotorTrim[0];
@@ -241,6 +259,9 @@ void handleStart() {
   gyro_calib_last_ms = 0;
   gyro_z_acc = 0.0f;
   gyro_z_samples = 0;
+  level_roll_acc = 0.0f;
+  level_pitch_acc = 0.0f;
+  level_samples = 0;
   server.send(200, "text/plain", "STARTED");
 }
 
@@ -317,7 +338,9 @@ void handleStatus() {
   json += "\"action\":\""; json += actionName(); json += "\",";
   json += "\"pwm\":"; json += String(base_pwm); json += ",";
   json += "\"target_pwm\":"; json += String(target_pwm); json += ",";
-  json += "\"gyro_z_bias\":"; json += String(gyro_z_bias, 2);
+  json += "\"gyro_z_bias\":"; json += String(gyro_z_bias, 2); json += ",";
+  json += "\"level_roll_bias\":"; json += String(level_roll_bias, 2); json += ",";
+  json += "\"level_pitch_bias\":"; json += String(level_pitch_bias, 2);
   json += "}";
   server.send(200, "application/json", json);
 }
@@ -380,6 +403,7 @@ void loop() {
   uint32_t now = millis();
   int16_t yaw_delta = 0;
   int16_t pitch_delta = 0;
+  int16_t roll_delta = 0;
 
   if (gyro_calibrating) {
     if (timePassed(now, gyro_calib_start_ms + kGyroCalibMs)) {
@@ -388,6 +412,13 @@ void loop() {
       } else {
         gyro_z_bias = 0.0f;
       }
+      if (level_samples > 0) {
+        level_roll_bias = level_roll_acc / (float)level_samples;
+        level_pitch_bias = level_pitch_acc / (float)level_samples;
+      } else {
+        level_roll_bias = 0.0f;
+        level_pitch_bias = 0.0f;
+      }
       gyro_calibrating = false;
       target_pwm = kIdlePwm;
     } else if (timePassed(now, gyro_calib_last_ms + kGyroSampleMs)) {
@@ -395,6 +426,14 @@ void loop() {
       fly.getGyroData(&gx, &gy, &gz); // deg/s
       gyro_z_acc += gz;
       gyro_z_samples++;
+
+      float ax = 0.0f, ay = 0.0f, az = 0.0f;
+      fly.getAccelData(&ax, &ay, &az);
+      float pitch = atan2f(-ax, sqrtf(ay * ay + az * az)) * 57.2958f;
+      float roll = atan2f(ay, az) * 57.2958f;
+      level_pitch_acc += pitch;
+      level_roll_acc += roll;
+      level_samples++;
       gyro_calib_last_ms = now;
     }
     fly.WriteAllPWM(0);
@@ -429,6 +468,29 @@ void loop() {
     yaw_delta += yaw_hold;
   }
 
+  // Leveling (roll always, pitch only when not commanded forward)
+  if (base_pwm >= kLevelMinPwm) {
+    float ax = 0.0f, ay = 0.0f, az = 0.0f;
+    fly.getAccelData(&ax, &ay, &az);
+    float pitch = atan2f(-ax, sqrtf(ay * ay + az * az)) * 57.2958f;
+    float roll = atan2f(ay, az) * 57.2958f;
+    pitch -= level_pitch_bias;
+    roll -= level_roll_bias;
+
+    if (fabsf(roll) < kLevelDeadband) roll = 0.0f;
+    if (fabsf(pitch) < kLevelDeadband) pitch = 0.0f;
+
+    int16_t roll_correction = (int16_t)constrain((int)(-roll * kLevelKp), -kLevelMax, kLevelMax);
+    roll_correction *= kRollDirection;
+    roll_delta += roll_correction;
+
+    if (action != ACTION_FORWARD) {
+      int16_t pitch_correction = (int16_t)constrain((int)(-pitch * kLevelKp), -kLevelMax, kLevelMax);
+      pitch_correction *= kPitchDirection;
+      pitch_delta += pitch_correction;
+    }
+  }
+
   if (timePassed(now, last_slew_ms + kPwmSlewMs)) {
     if (base_pwm < target_pwm) {
       uint16_t next_pwm = base_pwm + kPwmSlewStep;
@@ -440,5 +502,5 @@ void loop() {
     last_slew_ms = now;
   }
 
-  applyMotors(base_pwm, yaw_delta, pitch_delta);
+  applyMotors(base_pwm, yaw_delta, pitch_delta, roll_delta);
 }
