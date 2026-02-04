@@ -25,6 +25,10 @@ const uint8_t  kPwmSlewStep  = 2;    // PWM change per slew step
 const uint16_t kPwmSlewMs    = 20;   // Slew interval in ms
 const float    kYawHoldKp    = 0.9f; // PWM per deg/s (gyro Z). Tune to stop spin.
 const int16_t  kYawHoldMax   = 22;   // Max yaw correction
+const float    kYawHoldDeadband = 1.5f; // deg/s deadband to avoid small bias
+const uint8_t  kYawHoldMinPwm = 35;  // Only apply yaw-hold above this PWM
+const uint16_t kGyroCalibMs   = 600; // Gyro Z bias calibration time
+const uint16_t kGyroSampleMs  = 5;   // Gyro sample interval during calibration
 const uint8_t  kYawDelta     = 18;   // Yaw bias added/subtracted during rotate
 const uint8_t  kPitchDelta   = 18;   // Pitch bias for forward movement
 const uint32_t kRotateMs     = 700;  // Time-based 90-deg test (tune per frame)
@@ -142,6 +146,13 @@ uint8_t base_pwm = 0;   // current PWM actually applied
 uint8_t target_pwm = 0; // requested PWM (ramps to this)
 uint32_t last_slew_ms = 0;
 
+bool gyro_calibrating = false;
+uint32_t gyro_calib_start_ms = 0;
+uint32_t gyro_calib_last_ms = 0;
+float gyro_z_bias = 0.0f;
+float gyro_z_acc = 0.0f;
+uint16_t gyro_z_samples = 0;
+
 Action action = ACTION_NONE;
 uint32_t action_start_ms = 0;
 uint32_t action_end_ms = 0;
@@ -223,12 +234,18 @@ void handleStart() {
   estop_latched = false; // explicit re-arm
   armed = true;
   action = ACTION_NONE;
-  target_pwm = kIdlePwm;
+  target_pwm = 0;
+  base_pwm = 0;
+  gyro_calibrating = true;
+  gyro_calib_start_ms = millis();
+  gyro_calib_last_ms = 0;
+  gyro_z_acc = 0.0f;
+  gyro_z_samples = 0;
   server.send(200, "text/plain", "STARTED");
 }
 
 void handleRotateLeft() {
-  if (!armed || estop_latched) {
+  if (!armed || estop_latched || gyro_calibrating) {
     server.send(409, "text/plain", "IGNORED");
     return;
   }
@@ -239,7 +256,7 @@ void handleRotateLeft() {
 }
 
 void handleRotateRight() {
-  if (!armed || estop_latched) {
+  if (!armed || estop_latched || gyro_calibrating) {
     server.send(409, "text/plain", "IGNORED");
     return;
   }
@@ -250,7 +267,7 @@ void handleRotateRight() {
 }
 
 void handleUp() {
-  if (!armed || estop_latched) {
+  if (!armed || estop_latched || gyro_calibrating) {
     server.send(409, "text/plain", "IGNORED");
     return;
   }
@@ -261,7 +278,7 @@ void handleUp() {
 }
 
 void handleDown() {
-  if (!armed || estop_latched) {
+  if (!armed || estop_latched || gyro_calibrating) {
     server.send(409, "text/plain", "IGNORED");
     return;
   }
@@ -277,7 +294,7 @@ void handleDown() {
 }
 
 void handleForward() {
-  if (!armed || estop_latched) {
+  if (!armed || estop_latched || gyro_calibrating) {
     server.send(409, "text/plain", "IGNORED");
     return;
   }
@@ -296,9 +313,11 @@ void handleStatus() {
   String json = "{";
   json += "\"armed\":"; json += (armed ? "true" : "false"); json += ",";
   json += "\"estop\":"; json += (estop_latched ? "true" : "false"); json += ",";
+  json += "\"calib\":"; json += (gyro_calibrating ? "true" : "false"); json += ",";
   json += "\"action\":\""; json += actionName(); json += "\",";
   json += "\"pwm\":"; json += String(base_pwm); json += ",";
-  json += "\"target_pwm\":"; json += String(target_pwm);
+  json += "\"target_pwm\":"; json += String(target_pwm); json += ",";
+  json += "\"gyro_z_bias\":"; json += String(gyro_z_bias, 2);
   json += "}";
   server.send(200, "application/json", json);
 }
@@ -362,6 +381,27 @@ void loop() {
   int16_t yaw_delta = 0;
   int16_t pitch_delta = 0;
 
+  if (gyro_calibrating) {
+    if (timePassed(now, gyro_calib_start_ms + kGyroCalibMs)) {
+      if (gyro_z_samples > 0) {
+        gyro_z_bias = gyro_z_acc / (float)gyro_z_samples;
+      } else {
+        gyro_z_bias = 0.0f;
+      }
+      gyro_calibrating = false;
+      target_pwm = kIdlePwm;
+    } else if (timePassed(now, gyro_calib_last_ms + kGyroSampleMs)) {
+      float gx = 0.0f, gy = 0.0f, gz = 0.0f;
+      fly.getGyroData(&gx, &gy, &gz); // deg/s
+      gyro_z_acc += gz;
+      gyro_z_samples++;
+      gyro_calib_last_ms = now;
+    }
+    fly.WriteAllPWM(0);
+    base_pwm = 0;
+    return;
+  }
+
   if (action == ACTION_ROTATE_LEFT || action == ACTION_ROTATE_RIGHT) {
     if (timePassed(now, action_end_ms)) {
       action = ACTION_NONE;
@@ -377,9 +417,13 @@ void loop() {
   }
 
   // Yaw hold (stabilize rotation) when not actively rotating
-  if (action != ACTION_ROTATE_LEFT && action != ACTION_ROTATE_RIGHT) {
+  if (action != ACTION_ROTATE_LEFT && action != ACTION_ROTATE_RIGHT && base_pwm >= kYawHoldMinPwm) {
     float gx = 0.0f, gy = 0.0f, gz = 0.0f;
     fly.getGyroData(&gx, &gy, &gz); // deg/s
+    gz -= gyro_z_bias;
+    if (fabsf(gz) < kYawHoldDeadband) {
+      gz = 0.0f;
+    }
     int16_t yaw_hold = (int16_t)constrain((int)(-gz * kYawHoldKp), -kYawHoldMax, kYawHoldMax);
     yaw_hold *= kYawHoldDirection;
     yaw_delta += yaw_hold;
