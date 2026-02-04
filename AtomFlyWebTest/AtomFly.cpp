@@ -1,4 +1,5 @@
 #include "AtomFly.h"
+#include <esp_arduino_version.h>
 
 AtomFly::AtomFly(/* args */) {}
 
@@ -10,8 +11,12 @@ void AtomFly::begin() {
     _bmp = new Adafruit_BMP280(&Wire1);
 
     for (int i = 0; i < 4; i++) {
+#if defined(ESP_ARDUINO_VERSION) && (ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0))
+        ledcAttachChannel(_PWMPinMap[i], 10000, 8, i);
+#else
         ledcSetup(i, 10000, 8);
         ledcAttachPin(_PWMPinMap[i], i);
+#endif
     }
 }
 
@@ -110,12 +115,20 @@ int AtomFly::initFly(void) {
 }
 
 void AtomFly::WritePWM(uint8_t Motor, uint8_t pwmData) {
+#if defined(ESP_ARDUINO_VERSION) && (ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0))
+    ledcWriteChannel(Motor, pwmData);
+#else
     ledcWrite(Motor, pwmData);
+#endif
 }
 
 void AtomFly::WriteAllPWM(uint8_t pwmData) {
     for (size_t i = 0; i < 4; i++) {
+#if defined(ESP_ARDUINO_VERSION) && (ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0))
+        ledcWriteChannel(i, pwmData);
+#else
         ledcWrite(i, pwmData);
+#endif
     }
 }
 
