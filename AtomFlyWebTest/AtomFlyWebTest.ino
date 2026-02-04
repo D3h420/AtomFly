@@ -23,6 +23,8 @@ const uint8_t  kPwmStep      = 10;   // UP/DOWN step size
 const uint8_t  kMaxPwm       = 180;  // Safety cap (tune carefully)
 const uint8_t  kPwmSlewStep  = 2;    // PWM change per slew step
 const uint16_t kPwmSlewMs    = 20;   // Slew interval in ms
+const float    kYawHoldKp    = 0.9f; // PWM per deg/s (gyro Z). Tune to stop spin.
+const int16_t  kYawHoldMax   = 22;   // Max yaw correction
 const uint8_t  kYawDelta     = 18;   // Yaw bias added/subtracted during rotate
 const uint8_t  kPitchDelta   = 18;   // Pitch bias for forward movement
 const uint32_t kRotateMs     = 700;  // Time-based 90-deg test (tune per frame)
@@ -30,6 +32,7 @@ const uint32_t kForwardMs    = 450;  // Short forward "nudge" (tune per frame)
 
 // Flip if left/right rotate direction is reversed
 const int8_t kYawDirection = 1;
+const int8_t kYawHoldDirection = 1; // Flip if yaw-hold makes spin worse
 
 // Motor trim offsets to counter small imbalances (FL, FR, RR, RL).
 // Use small values like -3..+3. Defaults to 0.
@@ -371,6 +374,15 @@ void loop() {
     } else {
       pitch_delta = kPitchDelta;
     }
+  }
+
+  // Yaw hold (stabilize rotation) when not actively rotating
+  if (action != ACTION_ROTATE_LEFT && action != ACTION_ROTATE_RIGHT) {
+    float gx = 0.0f, gy = 0.0f, gz = 0.0f;
+    fly.getGyroData(&gx, &gy, &gz); // deg/s
+    int16_t yaw_hold = (int16_t)constrain((int)(-gz * kYawHoldKp), -kYawHoldMax, kYawHoldMax);
+    yaw_hold *= kYawHoldDirection;
+    yaw_delta += yaw_hold;
   }
 
   if (timePassed(now, last_slew_ms + kPwmSlewMs)) {
