@@ -31,13 +31,13 @@ const float    kYawHoldDeadband = 1.5f; // deg/s deadband to avoid small bias
 const uint8_t  kYawHoldMinPwm = 35;  // Only apply yaw-hold above this PWM
 const uint16_t kGyroCalibMs   = 600; // Gyro Z bias calibration time
 const uint16_t kGyroSampleMs  = 5;   // Gyro sample interval during calibration
-const float    kLevelKp       = 1.6f; // PWM per deg (roll/pitch)
-const float    kLevelKi       = 0.08f; // PWM per deg*s (auto-trim)
-const float    kLevelKd       = 0.12f; // PWM per deg/s
-const int16_t  kLevelMax      = 24;   // Max roll/pitch correction
-const float    kLevelDeadband = 0.6f; // deg deadband
+const float    kLevelKp       = 1.2f; // PWM per deg (roll/pitch)
+const float    kLevelKi       = 0.02f; // PWM per deg*s (auto-trim)
+const float    kLevelKd       = 0.08f; // PWM per deg/s
+const int16_t  kLevelMax      = 18;   // Max roll/pitch correction
+const float    kLevelDeadband = 0.8f; // deg deadband
 const uint8_t  kLevelMinPwm   = 45;   // Only apply leveling above this PWM
-const float    kLevelIMax     = 80.0f; // Integral clamp (deg*s)
+const float    kLevelIMax     = 40.0f; // Integral clamp (deg*s)
 const float    kAltStepCm     = 20.0f; // UP/DOWN step
 const float    kAltMinCm      = 5.0f;  // Minimum target altitude
 const float    kAltMaxCm      = 120.0f; // Maximum target altitude
@@ -51,7 +51,11 @@ const uint16_t kTofMinMm      = 30;   // Ignore below 3 cm
 const uint16_t kTofMaxMm      = 2000; // Ignore beyond 200 cm
 const uint16_t kAltTimeoutMs  = 400;  // ToF timeout before disabling hold
 const uint8_t  kAltMinPwm     = 70;   // Minimum PWM for altitude hold
-const uint8_t  kTakeoffPwm    = 85;   // Initial PWM for takeoff
+const uint8_t  kTakeoffPwm    = 90;   // Initial PWM for takeoff
+const uint8_t  kTakeoffMaxPwm = 130;  // Max PWM during takeoff ramp
+const uint8_t  kTakeoffRampStep = 3;  // PWM step during takeoff ramp
+const uint16_t kTakeoffTimeoutMs = 2200; // Max time to try takeoff
+const float    kAirborneMinCm = 8.0f; // Consider airborne above this height
 const uint8_t  kYawDelta     = 18;   // Yaw bias added/subtracted during rotate
 const float    kForwardTiltDeg = 6.0f; // Forward tilt angle during "forward"
 const uint32_t kRotateMs     = 700;  // Time-based 90-deg test (tune per frame)
@@ -59,7 +63,7 @@ const uint32_t kForwardMs    = 450;  // Short forward "nudge" (tune per frame)
 
 // Flip if left/right rotate direction is reversed
 const int8_t kYawDirection = 1;
-const int8_t kYawHoldDirection = -1; // Flip if yaw-hold makes spin worse
+const int8_t kYawHoldDirection = 1; // Flip if yaw-hold makes spin worse
 const int8_t kRollDirection = 1;    // Flip if roll leveling makes it worse
 const int8_t kPitchDirection = 1;   // Flip if pitch leveling makes it worse
 
@@ -205,6 +209,8 @@ uint32_t last_tof_update_ms = 0;
 uint32_t last_alt_ctrl_ms = 0;
 float alt_throttle_base = 0.0f;
 float last_alt_cm = 0.0f;
+bool takeoff_active = false;
+uint32_t takeoff_start_ms = 0;
 
 Action action = ACTION_NONE;
 uint32_t action_start_ms = 0;
@@ -224,14 +230,15 @@ void readImuMapped(float& acc_x, float& acc_y, float& acc_z,
   fly.getAccelData(&ax, &ay, &az);
   fly.getGyroData(&gx, &gy, &gz);
 
-  // Axis transform based on reference firmware mapping
-  acc_x = ay;
-  acc_y = ax;
-  acc_z = -az;
+  // AtomFly library uses raw axes for attitude; keep raw mapping here.
+  acc_x = ax;
+  acc_y = ay;
+  acc_z = az;
 
-  roll_rate  = gy;
-  pitch_rate = gx;
-  yaw_rate   = -gz;
+  // Standard body rates: X=roll, Y=pitch, Z=yaw
+  roll_rate  = gx;
+  pitch_rate = gy;
+  yaw_rate   = gz;
 }
 
 void updateTof(uint32_t now) {
@@ -307,6 +314,7 @@ void emergencyStop() {
   base_pwm = 0;
   target_pwm = 0;
   alt_hold = false;
+  takeoff_active = false;
   armed = false;
   estop_latched = true;
   fly.WriteAllPWM(0);
@@ -354,6 +362,8 @@ void handleStart() {
   last_alt_ctrl_ms = 0;
   alt_throttle_base = kIdlePwm;
   last_alt_cm = 0.0f;
+  takeoff_active = false;
+  takeoff_start_ms = 0;
   server.send(200, "text/plain", "STARTED");
 }
 
@@ -385,17 +395,22 @@ void handleUp() {
     return;
   }
   action = ACTION_NONE;
-  if (!alt_hold) {
-    alt_hold = true;
-    float current = alt_valid ? alt_cm : 0.0f;
-    target_alt_cm = current + kAltStepCm;
-    last_tof_update_ms = millis();
-  } else {
+  if (alt_hold) {
     target_alt_cm += kAltStepCm;
+    target_alt_cm = constrain(target_alt_cm, kAltMinCm, kAltMaxCm);
+  } else {
+    if (alt_valid && alt_cm > kAltMinCm) {
+      alt_hold = true;
+      target_alt_cm = alt_cm + kAltStepCm;
+      target_alt_cm = constrain(target_alt_cm, kAltMinCm, kAltMaxCm);
+    } else {
+      takeoff_active = true;
+      takeoff_start_ms = millis();
+      target_pwm = max(target_pwm, kTakeoffPwm);
+      alt_throttle_base = max(alt_throttle_base, (float)kTakeoffPwm);
+      last_tof_update_ms = millis();
+    }
   }
-  target_alt_cm = constrain(target_alt_cm, kAltMinCm, kAltMaxCm);
-  if (alt_throttle_base < kTakeoffPwm) alt_throttle_base = kTakeoffPwm;
-  if (target_pwm < kTakeoffPwm) target_pwm = kTakeoffPwm;
   server.send(200, "text/plain", "UP");
 }
 
@@ -449,6 +464,7 @@ void handleStatus() {
   json += "\"pwm\":"; json += String(base_pwm); json += ",";
   json += "\"target_pwm\":"; json += String(target_pwm); json += ",";
   json += "\"alt_hold\":"; json += (alt_hold ? "true" : "false"); json += ",";
+  json += "\"takeoff\":"; json += (takeoff_active ? "true" : "false"); json += ",";
   json += "\"alt_cm\":"; json += String(alt_cm, 1); json += ",";
   json += "\"alt_target_cm\":"; json += String(target_alt_cm, 1); json += ",";
   json += "\"roll_deg\":"; json += String(roll_deg, 1); json += ",";
@@ -507,6 +523,7 @@ void loop() {
     fly.WriteAllPWM(0);
     base_pwm = 0;
     alt_hold = false;
+    takeoff_active = false;
     return;
   }
 
@@ -514,6 +531,7 @@ void loop() {
     fly.WriteAllPWM(0);
     base_pwm = 0;
     alt_hold = false;
+    takeoff_active = false;
     return;
   }
 
@@ -610,8 +628,10 @@ void loop() {
 
   updateTof(now);
 
+  bool leveling_active = (base_pwm >= kTakeoffPwm) || alt_hold || takeoff_active;
+
   // Yaw hold (stabilize rotation) when not actively rotating
-  if (!rotating && base_pwm >= kYawHoldMinPwm) {
+  if (!rotating && leveling_active && base_pwm >= kYawHoldMinPwm) {
     float yaw_use = yaw_rate;
     if (fabsf(yaw_use) < kYawHoldDeadband) {
       yaw_use = 0.0f;
@@ -622,14 +642,16 @@ void loop() {
   }
 
   // Leveling with auto-trim (roll always, pitch follows target)
-  if (base_pwm >= kLevelMinPwm) {
+  if (leveling_active && base_pwm >= kLevelMinPwm) {
+    bool airborne = alt_valid && (alt_cm > kAirborneMinCm);
     float roll_err = -roll_deg;
     if (fabsf(roll_err) < kLevelDeadband) {
       roll_err = 0.0f;
-    } else {
+    } else if (airborne) {
       roll_i += roll_err * dt;
       roll_i = constrain(roll_i, -kLevelIMax, kLevelIMax);
     }
+    if (!airborne) roll_i = 0.0f;
     float roll_cmd = (kLevelKp * roll_err) + (kLevelKi * roll_i) - (kLevelKd * roll_rate);
     int16_t roll_correction = (int16_t)constrain((int)roll_cmd, -kLevelMax, kLevelMax);
     roll_delta += (roll_correction * kRollDirection);
@@ -637,13 +659,32 @@ void loop() {
     float pitch_err = pitch_target_deg - pitch_deg;
     if (fabsf(pitch_err) < kLevelDeadband) {
       pitch_err = 0.0f;
-    } else if (action != ACTION_FORWARD) {
+    } else if (action != ACTION_FORWARD && airborne) {
       pitch_i += pitch_err * dt;
       pitch_i = constrain(pitch_i, -kLevelIMax, kLevelIMax);
     }
+    if (!airborne) pitch_i = 0.0f;
     float pitch_cmd = (kLevelKp * pitch_err) + (kLevelKi * pitch_i) - (kLevelKd * pitch_rate);
     int16_t pitch_correction = (int16_t)constrain((int)pitch_cmd, -kLevelMax, kLevelMax);
     pitch_delta += (pitch_correction * kPitchDirection);
+  }
+
+  // Takeoff ramp (if ToF not yet valid)
+  if (takeoff_active) {
+    if (alt_valid && alt_cm > kAltMinCm) {
+      alt_hold = true;
+      takeoff_active = false;
+      target_alt_cm = alt_cm + kAltStepCm;
+      target_alt_cm = constrain(target_alt_cm, kAltMinCm, kAltMaxCm);
+      last_alt_ctrl_ms = 0;
+    } else if (timePassed(now, takeoff_start_ms + kTakeoffTimeoutMs)) {
+      takeoff_active = false;
+    } else if (timePassed(now, last_alt_ctrl_ms + kAltCtrlMs)) {
+      uint16_t next_pwm = target_pwm + kTakeoffRampStep;
+      target_pwm = (next_pwm > kTakeoffMaxPwm) ? kTakeoffMaxPwm : (uint8_t)next_pwm;
+      alt_throttle_base = max(alt_throttle_base, (float)target_pwm);
+      last_alt_ctrl_ms = now;
+    }
   }
 
   // Altitude hold (ToF)
