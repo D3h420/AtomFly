@@ -385,8 +385,8 @@ uint16_t AtomFly::readTOF() {
 
     byte val = 0;
     int cnt  = 0;
-    while (cnt < 100) {  // 1 second waiting time max
-        delay(10);
+    while (cnt < 15) {  // ~30ms waiting time max (avoid long control stalls)
+        delay(2);
         val = read_byte_data_at(VL53L0X_REG_RESULT_RANGE_STATUS);
         if (val & 0x01) break;
         cnt++;
